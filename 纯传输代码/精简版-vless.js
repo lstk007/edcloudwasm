@@ -1,9 +1,8 @@
-import {connect} from 'cloudflare:sockets';
 const uuid = 'd342d11e-d424-4583-b36e-524ab1f0afa4';
-const bufferSize = 512 * 1024;
+const bufferSize = 256 * 1024;
 const startThreshold = 50 * 1024 * 1024;
-const maxChunkLen = 64 * 1024;
-const flushTime = 4;
+const maxChunkLen = 4 * 1024;
+const flushTime = 3;
 const concurrency = 4;
 const getProxyHost = () => {
     const e = (Math.random() * 65536) | 0;
@@ -27,11 +26,12 @@ const _h = c => (c > 64 ? (c & 7) + 9 : c & 15);
 const _b = p => (_h(uuid.charCodeAt(p)) << 4) | _h(uuid.charCodeAt(p + 1));
 const U0 = _b(0), U1 = _b(2), U2 = _b(4), U3 = _b(6), U4 = _b(9), U5 = _b(11), U6 = _b(14), U7 = _b(16), U8 = _b(19), U9 = _b(21), U10 = _b(24), U11 = _b(26), U12 = _b(28), U13 = _b(30), U14 = _b(32), U15 = _b(34);
 const textDecoder = new TextDecoder;
+let fetcher = null;
 const concurrentConnect = (hostname, port) => {
     let settled = false;
     const attempts = new Array(concurrency);
     for (let i = 0; i < concurrency; i++) {
-        const socket = connect({hostname, port});
+        const socket = fetcher.connect({hostname, port});
         attempts[i] = socket.opened.then(() => {
             if (settled) {
                 socket.close();
@@ -49,62 +49,57 @@ const manualPipe = async (readable, writable, close, speed) => {
     if (speedLimit) {
         pipeStartThreshold = n > 256 ? Number.MAX_SAFE_INTEGER : n * 1048576;
         let bestSize = pipeBufferSize, bestTime = Infinity, bestDiff = Infinity;
-        for (let size = 262144; size <= 524288; size += 65536) {
+        for (let size = 262144; size <= 524288; size += 4096) {
             const timeMs = Math.max(2, Math.round(size * 1000 / pipeStartThreshold)), diff = Math.abs(size * 1000 / timeMs - pipeStartThreshold);
             if (diff < bestDiff || (diff === bestDiff && timeMs < bestTime)) bestSize = size, bestTime = timeMs, bestDiff = diff;
         }
         pipeBufferSize = bestSize, pipeFlushTime = bestTime;
     }
-    const safeBufferSize = pipeBufferSize - maxChunkLen, fastFlushOffset = maxChunkLen << 1;
+    const safeBufferSize = pipeBufferSize - maxChunkLen;
     let bufferView = new Uint8Array(pipeBufferSize), spareBuffer = new ArrayBuffer(maxChunkLen);
-    let offset = 0, totalBytes = 0, time = 0, timerId = null, resume = null, isReading = false;
-    let needsFlush = false, protectFlush = false, fastFlush = true, done, value;
+    let offset = 0, totalBytes = 0, time = 0, timerId = null, delays = 0, resume = null, done, value;
     const flushBuffer = () => {
-        if (isReading) return needsFlush = true;
-        fastFlush = offset < fastFlushOffset;
         if (offset > 0) (writable.send(bufferView.subarray(0, offset)), offset = 0);
-        needsFlush = false, protectFlush = false, timerId && (clearTimeout(timerId), timerId = null), resume?.(), resume = null;
+        timerId && (clearTimeout(timerId), timerId = null), resume?.(), resume = null;
+        delays = 0;
     };
     const reader = readable.getReader({mode: 'byob'});
     try {
         while (true) {
-            if (offset > 0 && protectFlush) {
+            if (offset > 0) {
                 ({done, value} = await reader.read(new Uint8Array(spareBuffer, 0, maxChunkLen)));
                 bufferView.set(value, offset), spareBuffer = value.buffer;
             } else {
-                isReading = offset > 0;
                 ({done, value} = await reader.read(new Uint8Array(bufferView.buffer, offset, maxChunkLen)));
-                isReading = false, bufferView = new Uint8Array(value.buffer);
+                bufferView = new Uint8Array(value.buffer);
             }
             if (done) break;
             const chunkLen = value.byteLength;
-            if (!chunkLen) {
-                needsFlush && flushBuffer();
-                continue;
-            }
             offset += chunkLen, totalBytes += chunkLen;
-            if (needsFlush) {
-                flushBuffer();
+            if (chunkLen < 4096) {
+                if (!speedLimit) totalBytes = 0;
+                time = 0;
             } else {
-                if (fastFlush || chunkLen < 28672) {
-                    if (!speedLimit) totalBytes = 0;
-                    time = 2;
-                } else if (totalBytes > pipeStartThreshold) time = pipeFlushTime;
-                timerId ||= setTimeout(flushBuffer, time), protectFlush = chunkLen < maxChunkLen;
-                offset > safeBufferSize && (totalBytes > pipeStartThreshold ? await new Promise(r => resume = r) : flushBuffer());
+                delays = 0;
+                if (totalBytes > pipeStartThreshold) time = pipeFlushTime;
             }
+            time === 0
+                ? (timerId ? (delays < 2 ? (clearTimeout(timerId), timerId = setTimeout(flushBuffer, 0), delays++) : flushBuffer()) : (timerId = setTimeout(flushBuffer, 0)))
+                : (timerId ||= setTimeout(flushBuffer, time));
+            offset > safeBufferSize && (totalBytes > pipeStartThreshold ? await new Promise(r => resume = r) : flushBuffer());
         }
-    } catch {offset = 0, close?.()} finally {isReading = false, flushBuffer()}
+    } catch {offset = 0, close?.()} finally {flushBuffer()}
 };
 const createBufferedTcpWriter = (tcpWriter, close) => {
     const buffer = new Uint8Array(32768);
-    let offset = 0, timerId = null, closed = false;
+    let offset = 0, timerId = null, delays = 0, closed = false;
     const closeWriter = () => {
         if (closed) return;
         closed = true, timerId && (clearTimeout(timerId), timerId = null), close?.();
     };
     const flush = () => {
         timerId && (clearTimeout(timerId), timerId = null);
+        delays = 0;
         if (!offset || closed) return;
         const len = offset;
         offset = 0;
@@ -114,7 +109,8 @@ const createBufferedTcpWriter = (tcpWriter, close) => {
         if (closed) return;
         const data = chunk.constructor === Uint8Array ? chunk : new Uint8Array(chunk), len = data.byteLength;
         if (!len) return;
-        offset + len > 32768 && flush(), buffer.set(data, offset), offset += len, offset === 32768 ? flush() : (timerId ||= setTimeout(flush, 2));
+        offset + len > 32768 && flush(), buffer.set(data, offset), offset += len;
+        offset === 32768 ? flush() : (timerId ? (delays < 2 ? (clearTimeout(timerId), timerId = setTimeout(flush, 0), delays++) : flush()) : (timerId = setTimeout(flush, 0)));
     };
 };
 const createAsyncMicrotaskQueue = (consume, close) => {
@@ -217,10 +213,11 @@ const handleXwebPost = async (request) => {
     const close = () => {if (state.xwebPipeTo) state.xwebPipeTo = false, reader.cancel().catch(() => {}), responseWriter.close().catch(() => {})};
     const writable = {send(chunk) {if (chunk?.byteLength) return responseWriter.write(chunk)}};
     (async () => {
-        let bufferView = new Uint8Array(32768), spareBuffer = new ArrayBuffer(8192), used = 0, uploaded = 0, timerId = null, done, value;
+        let bufferView = new Uint8Array(32768), spareBuffer = new ArrayBuffer(8192), used = 0, uploaded = 0, timerId = null, delays = 0, done, value;
         const flush = () => {
             if (used > 0 && state.tcpWriter && bufferView) (state.tcpWriter(bufferView.subarray(0, used)), used = 0);
             timerId && (clearTimeout(timerId), timerId = null);
+            delays = 0;
         };
         try {
             while (true) {
@@ -243,7 +240,7 @@ const handleXwebPost = async (request) => {
                         request.body.pipeThrough(upBridge).pipeTo(state.tcpSocket.writable);
                         break;
                     }
-                    used > 24576 ? flush() : (timerId ||= setTimeout(flush, 2));
+                    used > 24576 ? flush() : (timerId ? (delays < 2 ? (clearTimeout(timerId), timerId = setTimeout(flush, 0), delays++) : flush()) : (timerId = setTimeout(flush, 0)));
                 } else {
                     state.needMore = false;
                     await handleSession(bufferView.subarray(0, used), state, request, writable, close);
@@ -260,6 +257,7 @@ const handleXwebPost = async (request) => {
 };
 export default {
     async fetch(request) {
+        if (!fetcher) fetcher = request.fetcher;
         if (request.method === 'POST' && request.headers.get('content-type')?.startsWith('application/grpc')) return handleXwebPost(request);
         if (request.headers.get('Upgrade') === 'websocket') {
             const {0: clientSocket, 1: webSocket} = new WebSocketPair();
